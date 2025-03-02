@@ -1,0 +1,10 @@
+[package]
+name = "new-wordle-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22.1"
+bytemuck = "1.21.0"
+rayon = "1.10.0"
+rustc-hash = "2.1.1"
