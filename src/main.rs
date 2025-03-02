@@ -1,27 +1,21 @@
-//use rayon::ThreadPoolBuilder;
-use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+#![allow(clippy::needless_range_loop)]
+
+use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use std::fs::File;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+const MAX_GUESS_COUNT: usize = 4;
+const SMALL_STATE_SIZE: usize = 16;
+type State = SmallVec<[u16; SMALL_STATE_SIZE]>;
+const NUM_COLORINGS: usize = 243;
 const GREEN: u8 = 2;
 const YELLOW: u8 = 1;
 const GREY: u8 = 0;
 
 fn main() {
-    // Create a thread pool with a maximum of 4 threads.
-    //let pool = ThreadPoolBuilder::new().num_threads(10).build().unwrap();
-    //pool.install(|| {
-        rayon_main();
-    //});
-}
-
-fn rayon_main() {
     let answers = read_lines_from_file("answers.txt").expect("Could not read lines from file");
     println!("Answers: {}", answers.len());
 
@@ -38,13 +32,15 @@ fn rayon_main() {
     println!("All words: {}", all_words.len());
 
     let word_coloring_lookup = generate_word_coloring_lookup(&all_words);
+    let guess_coloring_lookup =
+        generate_guess_coloring_bitfields(&all_words, &answers, &word_coloring_lookup);
 
-    let initial_state = (0..answers.len() as u16).collect::<Vec<u16>>();
+    let mut states_per_guess_count: Vec<FxHashMap<State, usize>> = (0..=MAX_GUESS_COUNT + 1)
+        .map(|_| FxHashMap::default())
+        .collect();
 
-    let mut states_queue = vec![initial_state.clone()];
-    let seen_states_by_ones_count: Arc<Vec<RwLock<FxHashSet<Vec<u16>>>>> =
-        Arc::new((0..=answers.len()).map(|_| RwLock::new(FxHashSet::default())).collect());
-    seen_states_by_ones_count[initial_state.len()].write().unwrap().insert(initial_state);
+    let initial_state: State = (0..answers.len()).map(|i| i as u16).collect();
+    states_per_guess_count[0].insert(initial_state, 0);
 
     // Track how long it's been since last print
     let start_time = std::time::Instant::now();
@@ -53,171 +49,119 @@ fn rayon_main() {
     // Open a file for binary writing
     let file = File::create("seen_states.bin").expect("Could not create file");
     let mut writer = io::BufWriter::new(file);
-    let seen_states_bytes = AtomicUsize::new(0);
-    let seen_states_count = AtomicUsize::new(0);
-    let trivial_duplicate_states_count = AtomicUsize::new(0);
-    let duplicate_states_count = AtomicUsize::new(0);
-    let single_partitions_count = AtomicUsize::new(0);
-    let two_answers_count = AtomicUsize::new(0);
-    let total_states_processed = AtomicUsize::new(0);
-    //let mut total_prints = 0usize;
+    let mut seen_states_bytes = 0usize;
+    let mut seen_states_count = 0usize;
+    let mut duplicate_states_count = 0usize;
+    let mut duplicate_states_updated = 0usize;
+    let mut single_partitions_count = 0usize;
+    let mut num_small_states = 0usize;
+    let mut num_large_states = 0usize;
+    let mut states_processed_since_last_print = 0usize;
 
     // Write a header with a magic number for identification
     writer
         .write_all(b"WORDLESTATES")
         .expect("Could not write to file");
 
-    while let Some(state) = states_queue.pop() {
-        total_states_processed.fetch_add(1, Ordering::Relaxed);
+    for guess_count in 0..=MAX_GUESS_COUNT {
+        let mut states_processed_this_count = 0;
+        let total_states_this_count = states_per_guess_count[guess_count].len();
 
-        // Print progress every once in a while
-        if last_print_time.elapsed().as_millis() >= 5000 {
-            let seen_states_mb =
-                seen_states_bytes.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
-            println!(
-                "[{}s] [{:.1?}mb] States Encountered: {} (Processed: {}, Queue: {}), Duplicates: {} + {}, Single Partitions: {}, Two Answers: {}",
-                start_time.elapsed().as_secs(),
-                seen_states_mb,
-                seen_states_count.load(Ordering::Relaxed),
-                total_states_processed.load(Ordering::Relaxed),
-                states_queue.len(),
-                trivial_duplicate_states_count.load(Ordering::Relaxed),
-                duplicate_states_count.load(Ordering::Relaxed),
-                single_partitions_count.load(Ordering::Relaxed),
-                two_answers_count.load(Ordering::Relaxed)
-            );
+        let (current_states, next_states) = states_per_guess_count.split_at_mut(guess_count + 1);
+        for (state, &start_index) in current_states[guess_count].iter() {
+            let next_states = &mut next_states[0];
+            states_processed_this_count += 1;
+            states_processed_since_last_print += 1;
 
-            // Print histogram of number of states per ones count
-            let histogram = seen_states_by_ones_count
-                .iter()
-                .map(|set| set.read().unwrap().len())
-                .collect::<Vec<_>>();
-            let mut bucket_counts = vec![0; 10];
-            for (index, &count) in histogram.iter().enumerate() {
-                if count == 0 {
-                    continue;
-                }
-                let bucket_index = (index as f64).log2().floor() as usize;
-                if bucket_index >= bucket_counts.len() {
-                    bucket_counts.resize(bucket_index + 1, 0);
-                }
-                bucket_counts[bucket_index] += count;
+            // Print progress every once in a while
+            if last_print_time.elapsed().as_millis() >= 5000 {
+                let seen_states_mb = seen_states_bytes as f64 / (1024.0 * 1024.0);
+                println!(
+                    "[{}s] [{} guesses] [{:.1?}mb] [{:.1?} p/s] [{} processed] States Encountered: {}, Processed: {:.1?}% ({} / {}), Duplicates: {} ({} updated), Single Partitions: {}, SmallVec Efficiency: {:.2?}% (small: {}, large: {})",
+                    start_time.elapsed().as_secs(),
+                    guess_count,
+                    seen_states_mb,
+                    states_processed_since_last_print as f64
+                        / last_print_time.elapsed().as_secs_f64(),
+                    states_processed_since_last_print,
+                    seen_states_count,
+                    100.0 * states_processed_this_count as f64 / total_states_this_count as f64,
+                    states_processed_this_count,
+                    total_states_this_count,
+                    duplicate_states_count,
+                    duplicate_states_updated,
+                    single_partitions_count,
+                    100.0 * num_small_states as f64 / (num_small_states + num_large_states) as f64,
+                    num_small_states,
+                    num_large_states
+                );
+                states_processed_since_last_print = 0;
+                last_print_time = std::time::Instant::now();
             }
 
-            for (i, &count) in bucket_counts.iter().enumerate() {
-                if count == 0 {
-                    continue;
-                }
-                let range_start = 2_usize.pow(i as u32);
-                let range_end = 2_usize.pow(i as u32 + 1) - 1;
-                println!("{:>5} - {:>5}: {}", range_start, range_end, count);
-            }
-            println!();
-
-            // Reset the last print time and increment the total prints
-            last_print_time = std::time::Instant::now();
-            //total_prints += 1;
-
-            // Useful to reset the profilers after some time because the initial states may
-            // have a different timing profile
-            /*if total_prints == 5 {
-                // Reset profilers
-                prepass_profiler.reset();
-                create_partitions_profiler.reset();
-                fill_partitions_profiler.reset();
-                add_partitions_profiler.reset();
-                add_partitions_contains_profiler.reset();
-            }*/
-        }
-
-        let state_arc = Arc::new(state.clone()); // Share state across threads safely
-
-        let local_partitions: Vec<Vec<u16>> = (0..all_words.len())
-            .into_par_iter()
-            .filter_map(|guess_index| {
-                let state = Arc::clone(&state_arc);
-
-                // Prepass: Filter out trivial cases
-                let mut seen_colors = [false; 243];
-                let mut unique_colors = Vec::with_capacity(243);
-                for &answer_index in state.iter() {
-                    let answer_colors = word_coloring_lookup[answer_index as usize][guess_index];
-                    if !seen_colors[answer_colors as usize] {
-                        seen_colors[answer_colors as usize] = true;
-                        unique_colors.push(answer_colors);
-                    }
-                }
-                if unique_colors.len() <= 1 {
-                    single_partitions_count.fetch_add(1, Ordering::Relaxed);
-                    return None; // Skip processing this guess
-                }
-
+            for guess_index in start_index..answers.len() {
                 // Partitioning
-                let mut partitions: FxHashMap<u8, Vec<u16>> = FxHashMap::default();
-                for &answer_index in state.iter() {
-                    let answer_colors = word_coloring_lookup[answer_index as usize][guess_index];
-                    partitions
-                        .entry(answer_colors)
-                        .or_default()
-                        .push(answer_index);
-                }
-
-                // Collect all valid partitions (avoid modifying global structures)
-                let mut valid_partitions = Vec::new();
-                for partition in partitions.values() {
-                    let count = partition.len();
-                    if count <= 1 {
-                        trivial_duplicate_states_count.fetch_add(1, Ordering::Relaxed);
+                let mut partitions: SmallVec<[State; 8]> = SmallVec::new();
+                for guess_coloring in guess_coloring_lookup[guess_index].iter() {
+                    let partition = intersect_states(state, guess_coloring);
+                    // We don't really care about states with 1-2 words because the perfect
+                    // strategy once reaching those states is obvious.
+                    if partition.len() <= 2 {
                         continue;
                     }
 
-                    if seen_states_by_ones_count[count].read().unwrap().contains(partition) {
-                        duplicate_states_count.fetch_add(1, Ordering::Relaxed);
-                        continue;
+                    if partition.len() <= SMALL_STATE_SIZE {
+                        num_small_states += 1;
+                    } else {
+                        num_large_states += 1;
                     }
 
-                    valid_partitions.push(partition.clone()); // Collect for single-threaded processing
+                    if partition.len() == state.len() {
+                        assert!(partitions.is_empty());
+                        single_partitions_count += 1;
+                        break;
+                    }
+
+                    partitions.push(partition);
                 }
-                Some(valid_partitions)
-            })
-            .flatten()
-            .collect(); // Collect all valid partitions from threads
 
-        // Single-threaded processing phase:
-        for partition in local_partitions {
-            let count = partition.len();
+                for partition in partitions.iter() {
+                    if let Some(entry) = next_states.get_mut(partition) {
+                        let next_guess_index = guess_index + 1;
+                        if next_guess_index < *entry {
+                            *entry = next_guess_index;
+                            duplicate_states_updated += 1;
+                        }
+                        duplicate_states_count += 1;
+                    } else {
+                        next_states.insert(partition.clone(), guess_index);
 
-            // Insert into global deduplication set
-            if !seen_states_by_ones_count[count].write().unwrap().insert(partition.clone()) {
-                duplicate_states_count.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
+                        // Write to disk
+                        let bytes: &[u8] = bytemuck::cast_slice(partition.as_slice());
+                        writer
+                            .write_all(&(guess_count as u8).to_le_bytes())
+                            .expect("Write error");
+                        writer.write_all(bytes).expect("Write error");
+                        seen_states_bytes += bytes.len() + 1;
 
-            // Add new state to the queue
-            if count > 2 {
-                states_queue.push(partition.clone());
-            } else {
-                two_answers_count.fetch_add(1, Ordering::Relaxed);
-            }
-
-            // Write to file in a controlled manner
-            let bytes: &[u8] = bytemuck::cast_slice(&partition);
-            writer
-                .write_all(&(partition.len() as u16).to_le_bytes())
-                .expect("Write error");
-            writer.write_all(bytes).expect("Write error");
-            seen_states_bytes.fetch_add(bytes.len(), Ordering::Relaxed);
-
-            // Flush periodically
-            if seen_states_count.fetch_add(1, Ordering::Relaxed) % 1000 == 0 {
-                writer.flush().expect("Flush error");
+                        // Flush periodically
+                        seen_states_count += 1;
+                        if seen_states_count % 1000 == 0 {
+                            writer.flush().expect("Flush error");
+                        }
+                    }
+                }
             }
         }
+
+        println!(
+            "[{}s] Guess count {} completed and added {} states for next guess count",
+            start_time.elapsed().as_secs(),
+            guess_count,
+            next_states[0].len()
+        );
     }
-    println!(
-        "Total states: {}",
-        seen_states_count.load(Ordering::Relaxed)
-    );
+    println!("Total states: {}", seen_states_count);
 }
 
 fn read_lines_from_file<P>(filename: P) -> io::Result<Vec<String>>
@@ -289,6 +233,62 @@ fn generate_word_coloring_lookup(words: &[String]) -> Vec<Vec<u8>> {
         }
     }
     word_coloring_lookup
+}
+
+fn generate_guess_coloring_bitfields(
+    words: &[String],
+    answers: &[String],
+    word_coloring_lookup: &[Vec<u8>],
+) -> Vec<Vec<State>> {
+    let mut guess_coloring_lookup = Vec::with_capacity(words.len());
+    for guess_index in 0..words.len() {
+        let mut bitsets_by_color = vec![State::default(); NUM_COLORINGS];
+        for answer_index in 0..answers.len() {
+            let color_index = word_coloring_lookup[answer_index][guess_index] as usize;
+            bitsets_by_color[color_index].push(answer_index as u16);
+        }
+        guess_coloring_lookup.push(
+            bitsets_by_color
+                .iter()
+                .filter(|s| s.len() > 1)
+                .cloned()
+                .collect(),
+        );
+    }
+
+    guess_coloring_lookup
+}
+
+fn intersect_states(a: &State, b: &State) -> State {
+    if a.len() > b.len() {
+        return intersect_states(b, a); // Ensure 'a' is always the smaller one
+    }
+
+    let mut result = State::new();
+
+    if a.len() <= SMALL_STATE_SIZE {
+        for &val in a {
+            if b.binary_search(&val).is_ok() {
+                result.push(val);
+            }
+        }
+    } else {
+        // Otherwise, use two-pointer merging
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Equal => {
+                    result.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+            }
+        }
+    }
+
+    result
 }
 
 struct Profiler {
