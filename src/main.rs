@@ -35,7 +35,7 @@ fn main() {
     let guess_coloring_lookup =
         generate_guess_coloring_bitfields(&all_words, &answers, &word_coloring_lookup);
 
-    let mut states_per_guess_count: Vec<FxHashMap<State, usize>> = (0..=MAX_GUESS_COUNT + 1)
+    let mut states_per_guess_count: Vec<FxHashMap<State, usize>> = (0..=MAX_GUESS_COUNT)
         .map(|_| FxHashMap::default())
         .collect();
 
@@ -63,15 +63,18 @@ fn main() {
         .write_all(b"WORDLESTATES")
         .expect("Could not write to file");
 
-    for guess_count in 0..=MAX_GUESS_COUNT {
-        let mut states_processed_this_count = 0;
-        let total_states_this_count = states_per_guess_count[guess_count].len();
+    for guess_count in 0..MAX_GUESS_COUNT {
+        let states_to_process = states_per_guess_count[guess_count]
+            .iter()
+            .map(|(state, start_index)| (state.clone(), *start_index))
+            .collect::<Vec<_>>();
 
-        let (current_states, next_states) = states_per_guess_count.split_at_mut(guess_count + 1);
-        for (state, &start_index) in current_states[guess_count].iter() {
-            let next_states = &mut next_states[0];
-            states_processed_this_count += 1;
-            states_processed_since_last_print += 1;
+        let mut states_processed_this_count = 0;
+        let total_states_this_count = states_to_process.len();
+
+        for (state, start_index) in states_to_process.iter() {
+            let start_index = *start_index;
+            let next_states = &mut states_per_guess_count[guess_count + 1];
 
             // Print progress every once in a while
             if last_print_time.elapsed().as_millis() >= 5000 {
@@ -152,13 +155,16 @@ fn main() {
                     }
                 }
             }
+
+            states_processed_this_count += 1;
+            states_processed_since_last_print += 1;
         }
 
         println!(
             "[{}s] Guess count {} completed and added {} states for next guess count",
             start_time.elapsed().as_secs(),
             guess_count,
-            next_states[0].len()
+            states_per_guess_count[guess_count + 1].len()
         );
     }
     println!("Total states: {}", seen_states_count);
