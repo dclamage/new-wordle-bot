@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const MAX_GUESS_COUNT: usize = 4;
-const SMALL_STATE_SIZE: usize = 16;
+const SMALL_STATE_SIZE: usize = 32;
 type State = SmallVec<[u16; SMALL_STATE_SIZE]>;
 const NUM_COLORINGS: usize = 243;
 const GREEN: u8 = 2;
